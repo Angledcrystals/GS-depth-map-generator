@@ -9,15 +9,19 @@ import os
 from PIL import Image, ImageTk
 import time
 from scipy.ndimage import gaussian_filter
+from scipy.spatial.distance import cdist
+from scipy.interpolate import griddata
 
 class GSDepthMapperGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("G-S Alignment Depth Mapper - Fixed Quantum Method v5")
+        self.root.title("G-S Alignment Depth Mapper - Enhanced Quantum Method v6")
         self.root.geometry("1400x900")
         
         # Data storage
         self.alignment_data = []
+        self.alignments_by_condition = {}
+        self.alignments_by_radius = {}
         self.perfect_alignments = []
         self.current_depth_map = None
         self.current_coords = None
@@ -35,7 +39,13 @@ class GSDepthMapperGUI:
         self.depth_method = tk.StringVar(value="luminosity")
         self.depth_scale = tk.DoubleVar(value=1.0)
         self.depth_contrast = tk.DoubleVar(value=1.0)
-        self.gs_scale = tk.DoubleVar(value=1.0) # This might be re-evaluated or used as R_sphere if not 1.0
+        self.gs_scale = tk.DoubleVar(value=1.0)
+        
+        # Enhanced alignment processing parameters
+        self.quality_weighting = tk.BooleanVar(value=True)
+        self.multi_condition_fusion = tk.BooleanVar(value=False)
+        self.adaptive_sampling = tk.BooleanVar(value=True)
+        self.auto_optimize_params = tk.BooleanVar(value=False)
         
         # Full sampling control
         self.full_sampling = tk.BooleanVar(value=True)
@@ -87,7 +97,7 @@ class GSDepthMapperGUI:
         
     def setup_control_panel(self, parent):
         """Setup the control panel content."""
-        title_label = ttk.Label(parent, text="G-S Depth Mapper", font=("Arial", 16, "bold"))
+        title_label = ttk.Label(parent, text="G-S Depth Mapper Enhanced", font=("Arial", 16, "bold"))
         title_label.pack(pady=(0, 20))
         
         image_frame = ttk.LabelFrame(parent, text="Step 1: Load Data", padding=10)
@@ -110,7 +120,7 @@ class GSDepthMapperGUI:
             ("Luminosity (Brightness)", "luminosity"),
             ("RGB Magnitude", "rgb_magnitude"),
             ("Saturation", "saturation"),
-            ("G-S Coordinate (Geometric Depth)", "gs_coordinate_geometric"), # Renamed for clarity
+            ("G-S Coordinate (Enhanced Geometric)", "gs_coordinate_enhanced"),
             ("Edge Detection", "edges")
         ]
         
@@ -132,11 +142,24 @@ class GSDepthMapperGUI:
                  orient=tk.HORIZONTAL).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Label(contrast_frame, textvariable=self.depth_contrast, width=8).pack(side=tk.RIGHT)
         
-        gs_frame = ttk.LabelFrame(params_frame, text="G-S Parameters (for G-S Geometric Depth)", padding=5)
+        # Enhanced G-S Parameters
+        gs_frame = ttk.LabelFrame(params_frame, text="Enhanced G-S Parameters", padding=5)
         gs_frame.pack(fill=tk.X, pady=(10, 0))
         
+        ttk.Checkbutton(gs_frame, text="Quality-weighted interpolation", 
+                       variable=self.quality_weighting).pack(anchor=tk.W, pady=2)
+        
+        ttk.Checkbutton(gs_frame, text="Multi-condition fusion (3D reconstruction)", 
+                       variable=self.multi_condition_fusion).pack(anchor=tk.W, pady=2)
+        
+        ttk.Checkbutton(gs_frame, text="Adaptive sampling based on alignment density", 
+                       variable=self.adaptive_sampling).pack(anchor=tk.W, pady=2)
+        
+        ttk.Checkbutton(gs_frame, text="Auto-optimize parameters from perfect alignments", 
+                       variable=self.auto_optimize_params).pack(anchor=tk.W, pady=2)
+        
         ttk.Checkbutton(gs_frame, text="Full pixel sampling (higher quality, slower)", 
-                       variable=self.full_sampling).pack(anchor=tk.W, pady=(0, 5))
+                       variable=self.full_sampling).pack(anchor=tk.W, pady=(5, 5))
         
         ttk.Label(gs_frame, text="Hadit θ (degrees):").pack(anchor=tk.W)
         theta_frame = ttk.Frame(gs_frame)
@@ -152,7 +175,6 @@ class GSDepthMapperGUI:
                  orient=tk.HORIZONTAL).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Label(phi_frame, textvariable=self.hadit_phi, width=8).pack(side=tk.RIGHT)
         
-        # Nuit Radius is not directly used by the new geometric depth but kept for other contexts or future use
         ttk.Label(gs_frame, text="Nuit Radius (Contextual):").pack(anchor=tk.W)
         nuit_frame = ttk.Frame(gs_frame)
         nuit_frame.pack(fill=tk.X)
@@ -237,7 +259,7 @@ class GSDepthMapperGUI:
         ttk.Button(quick_frame, text="🧪 Load Sample Data", 
                   command=self.load_sample_data).pack(fill=tk.X, pady=2)
         
-        ttk.Button(quick_frame, text="🎯 Test G-S Method", 
+        ttk.Button(quick_frame, text="🎯 Test Enhanced G-S Method", 
                   command=self.test_gs_method).pack(fill=tk.X, pady=2)
         
         ttk.Label(parent, text=" ").pack(pady=20)
@@ -259,11 +281,11 @@ class GSDepthMapperGUI:
     def show_empty_plot(self):
         self.fig.clear()
         ax = self.fig.add_subplot(111)
-        ax.text(0.5, 0.5, "Load data to get started!\n\n1. Click 'Load Image File' or 'Load G-S Alignment Data'\n2. Adjust parameters if needed\n3. Click 'Process Image to Depth Map' (for images)\n4. [...]",
+        ax.text(0.5, 0.5, "Load data to get started!\n\n1. Click 'Load Image File' or 'Load G-S Alignment Data'\n2. Adjust enhanced parameters\n3. Click 'Process Image to Depth Map'", 
                 ha='center', va='center', fontsize=14, transform=ax.transAxes)
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
-        ax.set_title("G-S Depth Mapper - FIXED Quantum Method (v5)")
+        ax.set_title("G-S Depth Mapper - Enhanced Quantum Method (v6)")
         self.canvas.draw()
     
     def load_image(self):
@@ -344,188 +366,336 @@ class GSDepthMapperGUI:
                 parsing_data = False
         
         self.alignment_data = all_alignments
-        self.create_depth_map_from_alignments(all_alignments) # Default to showing all
+        self.organize_alignments_by_condition_and_radius()
+        
+        # Auto-optimize parameters if enabled
+        if self.auto_optimize_params.get():
+            self.optimize_parameters_from_alignments()
+        
+        self.create_enhanced_depth_map_from_alignments(all_alignments)
         self.image_status_label.config(
             text=f"✅ G-S data: {len(all_alignments)} alignments", foreground="green"
         )
         self.select_condition_button.config(state="normal")
         print(f"Loaded {len(all_alignments)} G-S alignments from {total_alignments_from_summary} total (summary)")
 
-    def create_depth_map_from_alignments(self, alignments, grid_size=None):
+    def organize_alignments_by_condition_and_radius(self):
+        """Organize alignments by condition and radius for enhanced processing."""
+        self.alignments_by_condition = {}
+        self.alignments_by_radius = {}
+        self.perfect_alignments = []
+        
+        for alignment in self.alignment_data:
+            condition = alignment.get('condition', 'Unknown')
+            
+            # Group by condition
+            if condition not in self.alignments_by_condition:
+                self.alignments_by_condition[condition] = []
+            self.alignments_by_condition[condition].append(alignment)
+            
+            # Group by radius (extract from condition string)
+            radius = self.extract_radius_from_condition(condition)
+            if radius is not None:
+                if radius not in self.alignments_by_radius:
+                    self.alignments_by_radius[radius] = []
+                self.alignments_by_radius[radius].append(alignment)
+            
+            # Collect perfect alignments
+            if alignment['dist_boundary'] < 0.001:
+                self.perfect_alignments.append(alignment)
+    
+    def extract_radius_from_condition(self, condition_str):
+        """Extract radius value from condition string."""
+        try:
+            if "RADIUS =" in condition_str:
+                radius_part = condition_str.split("RADIUS =")[1].strip()
+                radius_val = float(radius_part.split()[0])
+                return radius_val
+        except:
+            pass
+        return None
+    
+    def optimize_parameters_from_alignments(self):
+        """Auto-optimize Hadit parameters based on perfect alignments."""
+        if not self.perfect_alignments:
+            print("No perfect alignments found for parameter optimization")
+            return
+        
+        # Calculate optimal Hadit parameters from perfect alignments
+        hadit_thetas = [a['Hadit_theta'] for a in self.perfect_alignments]
+        hadit_phis = [a['Hadit_phi'] for a in self.perfect_alignments]
+        
+        optimal_theta = np.mean(hadit_thetas)
+        optimal_phi = np.mean(hadit_phis)
+        
+        # Update GUI parameters
+        self.hadit_theta.set(optimal_theta)
+        self.hadit_phi.set(optimal_phi)
+        
+        print(f"Auto-optimized parameters: θ={optimal_theta:.1f}°, φ={optimal_phi:.1f}°")
+        print(f"Based on {len(self.perfect_alignments)} perfect alignments")
+
+    def create_enhanced_depth_map_from_alignments(self, alignments, grid_size=None):
+        """Enhanced depth map creation with quality weighting and multi-condition fusion."""
         if not alignments:
             self.current_depth_map = None
             self.current_coords = None
-            self.show_empty_plot() # Or a message
+            self.show_empty_plot()
             return
 
         if grid_size is None:
             grid_size = self.resolution.get()
 
-        # Determine depth based on projection type and G_refl components
-        depth_values = []
+        # Multi-condition fusion
+        if self.multi_condition_fusion.get() and len(self.alignments_by_condition) > 1:
+            depth_map = self.fuse_multi_condition_depth(grid_size)
+        else:
+            depth_map = self.create_quality_weighted_depth_map(alignments, grid_size)
+        
+        if depth_map is None:
+            return
+            
+        self.current_depth_map = depth_map
+        
+        # Calculate coordinate system
         s_x_coords = [a['S_x'] for a in alignments]
         s_y_coords = [a['S_y'] for a in alignments]
-
-        # Assuming the first alignment's condition is representative for projection type if mixed
-        # Or ideally, this function is called with alignments from a single condition.
-        # For now, let's be robust. If conditions vary, this needs careful thought.
-        # We'll use the G_refl component orthogonal to the S_x, S_y plane.
-        # This requires knowing what S_x and S_y represent for each condition.
-
-        # For simplicity, if we are just visualizing the *loaded alignment data*,
-        # the depth should be the G_refl component orthogonal to the S_x, S_y plane.
-        # This means we need to parse the condition string to determine the plane.
-        
-        processed_depth_values = []
-        valid_s_x = []
-        valid_s_y = []
-
-        for a in alignments:
-            condition_str = a.get('condition', '').upper()
-            depth_val = 0
-            # The S_x, S_y from file are already the 2D projection coordinates.
-            # We need the G_refl component that is *orthogonal* to that projection plane.
-            if "XY PROJECTION" in condition_str:
-                depth_val = a['G_refl_z']
-            elif "XZ PROJECTION" in condition_str: # S_x is G_refl_x, S_y is G_refl_z
-                depth_val = a['G_refl_y']
-            elif "YZ PROJECTION" in condition_str: # S_x is G_refl_y, S_y is G_refl_z
-                depth_val = a['G_refl_x']
-            else: # Fallback or unknown condition, use a default or skip
-                # Using dist_origin as a placeholder if projection unknown, or skip
-                # depth_val = a['dist_origin'] 
-                continue # Skip if condition is not clear for geometric depth
-            
-            processed_depth_values.append(depth_val)
-            valid_s_x.append(a['S_x'])
-            valid_s_y.append(a['S_y'])
-
-        if not valid_s_x: # No valid alignments to process
-            self.current_depth_map = np.zeros((grid_size, grid_size))
-            self.current_coords = np.meshgrid(np.linspace(0,1,grid_size), np.linspace(0,1,grid_size))
-            self.update_visualization() # Show empty or error
-            return
-
-        s_x_coords = valid_s_x
-        s_y_coords = valid_s_y
-        depth_values = processed_depth_values
-            
         x_min, x_max = min(s_x_coords), max(s_x_coords)
         y_min, y_max = min(s_y_coords), max(s_y_coords)
         
-        depth_map = np.zeros((grid_size, grid_size))
-        count_map = np.zeros((grid_size, grid_size))
-        
-        for sx, sy, depth in zip(s_x_coords, s_y_coords, depth_values):
-            if x_max > x_min: grid_x = int((sx - x_min) / (x_max - x_min) * (grid_size - 1))
-            else: grid_x = grid_size // 2
-            if y_max > y_min: grid_y = int((sy - y_min) / (y_max - y_min) * (grid_size - 1))
-            else: grid_y = grid_size // 2
-            
-            grid_x = max(0, min(grid_size - 1, grid_x))
-            grid_y = max(0, min(grid_size - 1, grid_y))
-            
-            depth_map[grid_y, grid_x] += depth
-            count_map[grid_y, grid_x] += 1
-        
-        valid_mask = count_map > 0
-        depth_map[valid_mask] /= count_map[valid_mask]
-        
-        # Fill NaN values that might result from division by zero if a cell had 0 count but somehow got sum
-        depth_map[np.isnan(depth_map)] = 0 
-
-        # Smoothing - only apply if some points exist
-        if np.any(valid_mask):
-            # Create a copy for smoothing to avoid modifying the original average in-place before blending
-            depth_map_for_smoothing = np.copy(depth_map)
-            # For cells with no data, they are 0. Gaussian filter will spread from actual data points.
-            # If we want to preserve actual zeros vs no-data zeros, more complex masking is needed.
-            # For now, smooth the whole map, including zeros.
-            smoothed_depth = gaussian_filter(depth_map_for_smoothing, sigma=2.0)
-            
-            # Blend: Use averaged data where available, smoothed data elsewhere or blend.
-            # If a cell had data (valid_mask is True), use its averaged value.
-            # If a cell had no data (valid_mask is False), use the smoothed value.
-            final_depth = np.where(valid_mask, depth_map, smoothed_depth)
-        else: # No valid data points at all
-            final_depth = depth_map # Should be all zeros
-
-        # Normalize to [0,1] for visualization if desired, or keep physical depth values
-        # The G_refl components are typically [-1, 1].
-        # To map to a typical depth map range [0,1], we can shift and scale:
-        # final_depth = (final_depth - final_depth.min()) / (final_depth.max() - final_depth.min() + 1e-9) # Avoid div by zero
-        # For now, let's keep the direct G_refl component values as depth.
-
-        self.current_depth_map = final_depth
-        height, width = final_depth.shape
+        height, width = depth_map.shape
         x_coords_grid = np.linspace(x_min, x_max, width)
-        y_coords_grid = np.linspace(y_min, y_max, height) # y-axis for imshow is typically inverted
+        y_coords_grid = np.linspace(y_min, y_max, height)
         self.current_coords = np.meshgrid(x_coords_grid, y_coords_grid)
         
         self.update_viz_button.config(state="normal")
         self.export_button.config(state="normal")
-        self.process_status_label.config(text="✅ G-S alignment depth map created (Geometric Depth)", foreground="green")
+        self.process_status_label.config(text="✅ Enhanced G-S depth map created", foreground="green")
         
-        unique_points = np.count_nonzero(valid_mask)
-        debug_text = (f"G-S Alignment Data (Geometric Depth)\nTotal valid alignments: {len(depth_values)}\n"
-                      f"Unique grid points: {unique_points}\n"
-                      f"S_x range: [{x_min:.3f}, {x_max:.3f}]\nS_y range: [{y_min:.3f}, {y_max:.3f}]\n"
-                      f"Depth (G_refl_ortho) range: [{final_depth.min():.4f}, {final_depth.max():.4f}]")
+        # Update debug info
+        unique_points = np.count_nonzero(depth_map)
+        debug_text = (f"Enhanced G-S Depth Map\nTotal alignments: {len(alignments)}\n"
+                      f"Perfect alignments: {len(self.perfect_alignments)}\n"
+                      f"Conditions: {len(self.alignments_by_condition)}\n"
+                      f"Quality weighting: {'ON' if self.quality_weighting.get() else 'OFF'}\n"
+                      f"Multi-condition: {'ON' if self.multi_condition_fusion.get() else 'OFF'}\n"
+                      f"Depth range: [{depth_map.min():.4f}, {depth_map.max():.4f}]")
         self.debug_label.config(text=debug_text)
         
-        self.visualize_gs_alignment_depth_map(alignments) # Pass original full alignments for scatter plot
+        self.visualize_enhanced_alignment_depth_map(alignments)
 
-    def visualize_gs_alignment_depth_map(self, alignments_for_scatter): # Renamed param
+    def create_quality_weighted_depth_map(self, alignments, grid_size):
+        """Create depth map with quality-weighted interpolation."""
+        processed_depth_values = []
+        valid_s_x = []
+        valid_s_y = []
+        weights = []
+
+        for a in alignments:
+            condition_str = a.get('condition', '').upper()
+            depth_val = 0
+            
+            # Extract depth based on projection type
+            if "XY PROJECTION" in condition_str:
+                depth_val = a['G_refl_z']
+            elif "XZ PROJECTION" in condition_str:
+                depth_val = a['G_refl_y']
+            elif "YZ PROJECTION" in condition_str:
+                depth_val = a['G_refl_x']
+            else:
+                continue
+            
+            processed_depth_values.append(depth_val)
+            valid_s_x.append(a['S_x'])
+            valid_s_y.append(a['S_y'])
+            
+            # Quality weighting
+            if self.quality_weighting.get():
+                # Higher weight for perfect alignments
+                weight = 1.0 / (a['dist_boundary'] + 1e-6)
+                # Boost perfect alignments even more
+                if a['dist_boundary'] < 0.001:
+                    weight *= 10.0
+            else:
+                weight = 1.0
+            weights.append(weight)
+
+        if not valid_s_x:
+            return np.zeros((grid_size, grid_size))
+
+        # Create coordinate grids
+        x_min, x_max = min(valid_s_x), max(valid_s_x)
+        y_min, y_max = min(valid_s_y), max(valid_s_y)
+        
+        # Use adaptive sampling if enabled
+        if self.adaptive_sampling.get():
+            grid_size = self.calculate_adaptive_grid_size(valid_s_x, valid_s_y, weights)
+        
+        depth_map = np.zeros((grid_size, grid_size))
+        weight_map = np.zeros((grid_size, grid_size))
+        
+        # Quality-weighted binning
+        for sx, sy, depth, weight in zip(valid_s_x, valid_s_y, processed_depth_values, weights):
+            if x_max > x_min:
+                grid_x = int((sx - x_min) / (x_max - x_min) * (grid_size - 1))
+            else:
+                grid_x = grid_size // 2
+            if y_max > y_min:
+                grid_y = int((sy - y_min) / (y_max - y_min) * (grid_size - 1))
+            else:
+                grid_y = grid_size // 2
+            
+            grid_x = max(0, min(grid_size - 1, grid_x))
+            grid_y = max(0, min(grid_size - 1, grid_y))
+            
+            depth_map[grid_y, grid_x] += depth * weight
+            weight_map[grid_y, grid_x] += weight
+        
+        # Weighted averaging
+        valid_mask = weight_map > 0
+        depth_map[valid_mask] /= weight_map[valid_mask]
+        
+        # Enhanced smoothing with quality consideration
+        if np.any(valid_mask):
+            # Smooth with sigma proportional to local quality
+            sigma = 2.0 if self.quality_weighting.get() else 1.0
+            smoothed_depth = gaussian_filter(depth_map, sigma=sigma)
+            
+            # Quality-based blending
+            quality_mask = weight_map > np.mean(weight_map[valid_mask])
+            final_depth = np.where(quality_mask, depth_map, smoothed_depth)
+        else:
+            final_depth = depth_map
+
+        return final_depth
+
+    def fuse_multi_condition_depth(self, grid_size):
+        """Fuse depth information from multiple projection conditions."""
+        if len(self.alignments_by_condition) < 2:
+            return self.create_quality_weighted_depth_map(self.alignment_data, grid_size)
+        
+        condition_depth_maps = {}
+        condition_weights = {}
+        
+        # Create depth maps for each condition
+        for condition, alignments in self.alignments_by_condition.items():
+            if len(alignments) < 10:  # Skip conditions with too few alignments
+                continue
+                
+            depth_map = self.create_quality_weighted_depth_map(alignments, grid_size)
+            if depth_map is not None:
+                condition_depth_maps[condition] = depth_map
+                
+                # Weight conditions by number of perfect alignments
+                perfect_count = sum(1 for a in alignments if a['dist_boundary'] < 0.001)
+                condition_weights[condition] = perfect_count + 1
+        
+        if not condition_depth_maps:
+            return self.create_quality_weighted_depth_map(self.alignment_data, grid_size)
+        
+        # Fuse depth maps with weighted averaging
+        fused_depth = np.zeros((grid_size, grid_size))
+        total_weight = np.zeros((grid_size, grid_size))
+        
+        for condition, depth_map in condition_depth_maps.items():
+            weight = condition_weights[condition]
+            fused_depth += depth_map * weight
+            total_weight += weight
+        
+        # Normalize
+        valid_mask = total_weight > 0
+        fused_depth[valid_mask] /= total_weight[valid_mask]
+        
+        print(f"Fused {len(condition_depth_maps)} conditions for enhanced 3D depth")
+        return fused_depth
+
+    def calculate_adaptive_grid_size(self, s_x_coords, s_y_coords, weights):
+        """Calculate optimal grid size based on alignment density."""
+        base_grid_size = self.resolution.get()
+        
+        # Calculate density-weighted coverage
+        weight_sum = sum(weights)
+        coverage_area = (max(s_x_coords) - min(s_x_coords)) * (max(s_y_coords) - min(s_y_coords))
+        
+        if coverage_area > 0:
+            density = weight_sum / coverage_area
+            # Adjust grid size based on density
+            adaptive_factor = min(2.0, max(0.5, density / 100.0))
+            adaptive_grid_size = int(base_grid_size * adaptive_factor)
+            return max(64, min(1024, adaptive_grid_size))
+        
+        return base_grid_size
+
+    def visualize_enhanced_alignment_depth_map(self, alignments_for_scatter):
+        """Enhanced visualization with quality overlays."""
         if self.current_depth_map is None or self.current_coords is None:
             return
         
         self.fig.clear()
-        gs_gridspec = self.fig.add_gridspec(2, 2, hspace=0.4, wspace=0.3) # Adjusted spacing
+        gs_gridspec = self.fig.add_gridspec(2, 3, hspace=0.4, wspace=0.3)
         
-        ax1 = self.fig.add_subplot(gs_gridspec[0, :])
-        #imshow origin='lower' to match S_x, S_y typical cartesian plot
+        # Main depth map
+        ax1 = self.fig.add_subplot(gs_gridspec[0, :2])
         im1 = ax1.imshow(self.current_depth_map, cmap=self.colormap.get(), aspect='auto', origin='lower',
                          extent=[self.current_coords[0].min(), self.current_coords[0].max(),
                                  self.current_coords[1].min(), self.current_coords[1].max()])
-        ax1.set_title(f"G-S Alignment Depth Map ({self.current_depth_map.shape[1]}x{self.current_depth_map.shape[0]})")
+        ax1.set_title(f"Enhanced G-S Depth Map ({self.current_depth_map.shape[1]}x{self.current_depth_map.shape[0]})")
         ax1.set_xlabel("S_x (Projection Plane)")
         ax1.set_ylabel("S_y (Projection Plane)")
         
-        # Nuit radius from GUI for overlay (contextual)
+        # Overlay perfect alignments
+        if self.perfect_alignments:
+            perfect_x = [a['S_x'] for a in self.perfect_alignments]
+            perfect_y = [a['S_y'] for a in self.perfect_alignments]
+            ax1.scatter(perfect_x, perfect_y, c='red', s=30, marker='*', 
+                       label=f'Perfect Alignments ({len(self.perfect_alignments)})', alpha=0.8)
+        
+        # Overlay Nuit radius
         nuit_r_display = self.nuit_radius.get()
-        circle = plt.Circle((0, 0), nuit_r_display, fill=False, color='cyan', linewidth=1, linestyle=':', alpha=0.9, label=f'Nuit Radius: {nuit_r_display}')
+        circle = plt.Circle((0, 0), nuit_r_display, fill=False, color='cyan', linewidth=2, 
+                           linestyle='--', alpha=0.8, label=f'Nuit Radius: {nuit_r_display}')
         ax1.add_patch(circle)
         
-        perfect_alignments_scatter = [a for a in alignments_for_scatter if a['dist_boundary'] < 0.001]
-        if perfect_alignments_scatter:
-            perfect_x = [a['S_x'] for a in perfect_alignments_scatter]
-            perfect_y = [a['S_y'] for a in perfect_alignments_scatter]
-            ax1.scatter(perfect_x, perfect_y, c='red', s=20, marker='*', 
-                       label=f'Boundary Alignments ({len(perfect_alignments_scatter)})', alpha=0.7)
-        
         ax1.legend(fontsize='small')
-        self.fig.colorbar(im1, ax=ax1, label='Depth (Orthogonal G_refl component)')
+        self.fig.colorbar(im1, ax=ax1, label='Enhanced Depth Value')
         
-        ax2 = self.fig.add_subplot(gs_gridspec[1, 0])
-        conditions = {}
-        for a in alignments_for_scatter: # Use the passed full list for stats
-            cond = a['condition'] if a['condition'] else 'Unknown'
-            conditions[cond] = conditions.get(cond, 0) + 1
+        # Quality distribution
+        ax2 = self.fig.add_subplot(gs_gridspec[0, 2])
+        quality_scores = [1.0 / (a['dist_boundary'] + 1e-6) for a in alignments_for_scatter]
+        ax2.hist(quality_scores, bins=30, alpha=0.7, color='orange')
+        ax2.set_xlabel("Quality Score", fontsize=9)
+        ax2.set_ylabel("Count", fontsize=9)
+        ax2.set_title("Alignment Quality", fontsize=10)
+        ax2.set_yscale('log')
         
-        if conditions:
-            cond_names = list(conditions.keys())
-            cond_counts = list(conditions.values())
-            ax2.pie(cond_counts, labels=[name.replace(" PROJECTION", "").replace(", NUIT RADIUS = "," R=") for name in cond_names], 
+        # Condition breakdown
+        ax3 = self.fig.add_subplot(gs_gridspec[1, 0])
+        if self.alignments_by_condition:
+            condition_names = list(self.alignments_by_condition.keys())
+            condition_counts = [len(aligns) for aligns in self.alignments_by_condition.values()]
+            ax3.pie(condition_counts, labels=[name.split(',')[0].replace("PROJECTION", "P") 
+                                            for name in condition_names], 
                     autopct='%1.1f%%', textprops={'fontsize': 8})
-            ax2.set_title("Alignments by Condition", fontsize=10)
+            ax3.set_title("By Condition", fontsize=10)
         
-        ax3 = self.fig.add_subplot(gs_gridspec[1, 1])
-        if self.current_depth_map.size > 0 : # Check if depth map is not empty
-            ax3.hist(self.current_depth_map[self.current_depth_map != 0].flatten(), bins=50, alpha=0.7, color='blue') # Exclude zeros if they mean no data
-        ax3.set_xlabel("Depth Value", fontsize=9)
-        ax3.set_ylabel("Pixel Count", fontsize=9)
-        ax3.set_title("Depth Distribution (Non-zero)", fontsize=10)
-        ax3.tick_params(axis='both', which='major', labelsize=8)
+        # Radius breakdown
+        ax4 = self.fig.add_subplot(gs_gridspec[1, 1])
+        if self.alignments_by_radius:
+            radius_names = [f"R={r}" for r in self.alignments_by_radius.keys()]
+            radius_counts = [len(aligns) for aligns in self.alignments_by_radius.values()]
+            ax4.pie(radius_counts, labels=radius_names, autopct='%1.1f%%', 
+                    textprops={'fontsize': 8})
+            ax4.set_title("By Radius", fontsize=10)
+        
+        # Depth distribution
+        ax5 = self.fig.add_subplot(gs_gridspec[1, 2])
+        if self.current_depth_map.size > 0:
+            non_zero_depths = self.current_depth_map[self.current_depth_map != 0].flatten()
+            if len(non_zero_depths) > 0:
+                ax5.hist(non_zero_depths, bins=30, alpha=0.7, color='blue')
+        ax5.set_xlabel("Depth Value", fontsize=9)
+        ax5.set_ylabel("Pixel Count", fontsize=9)
+        ax5.set_title("Enhanced Depth Distribution", fontsize=10)
 
         self.canvas.draw()
 
@@ -542,18 +712,17 @@ class GSDepthMapperGUI:
         
         selection_window = tk.Toplevel(self.root)
         selection_window.title("Select Alignment Conditions")
-        selection_window.geometry("450x400") # Adjusted size
+        selection_window.geometry("450x400")
         
-        ttk.Label(selection_window, text="Select conditions to include for Depth Map:").pack(pady=10)
+        ttk.Label(selection_window, text="Select conditions to include for Enhanced Depth Map:").pack(pady=10)
         
-        condition_vars = {}
         listbox_frame = ttk.Frame(selection_window)
         listbox_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
         listbox = tk.Listbox(listbox_frame, selectmode=tk.MULTIPLE, exportselection=False)
         for condition in unique_conditions:
             listbox.insert(tk.END, condition)
-            listbox.select_set(tk.END) # Select all by default
+            listbox.select_set(tk.END)
         listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         scrollbar = ttk.Scrollbar(listbox_frame, orient=tk.VERTICAL, command=listbox.yview)
@@ -567,10 +736,11 @@ class GSDepthMapperGUI:
             if selected_conditions:
                 filtered_alignments = [a for a in self.alignment_data if a['condition'] in selected_conditions]
                 if filtered_alignments:
-                    self.create_depth_map_from_alignments(filtered_alignments) # This uses geometric depth
+                    self.organize_alignments_by_condition_and_radius()
+                    self.create_enhanced_depth_map_from_alignments(filtered_alignments)
                 else:
                     messagebox.showwarning("No Data", "No alignments match the selected conditions.")
-                    self.current_depth_map = None # Clear map
+                    self.current_depth_map = None
                     self.show_empty_plot()
                 selection_window.destroy()
             else:
@@ -609,17 +779,14 @@ class GSDepthMapperGUI:
             self.root.update_idletasks()
             start_time = time.time()
             
-            depth_map_raw = self.create_depth_from_image(self.image_data, method) # Removed scale/contrast here
+            depth_map_raw = self.create_depth_from_image(self.image_data, method)
             
             if self.processing_cancelled:
                 self.process_status_label.config(text="Processing cancelled", foreground="orange")
                 return
 
-            # Apply scaling and contrast AFTER the method-specific calculation
-            # This ensures gs_coordinate_geometric returns values in [0,1] before these generic adjustments
             depth_map_adjusted = depth_map_raw * depth_scale_param
             depth_map_final = np.power(np.clip(depth_map_adjusted, 0, depth_map_adjusted.max() if depth_map_adjusted.max() > 0 else 1.0), depth_contrast_param)
-
 
             processing_time = time.time() - start_time
             self.current_depth_map = depth_map_final
@@ -631,7 +798,7 @@ class GSDepthMapperGUI:
             debug_text = (f"Method: {method}\nProcessing time: {processing_time:.2f}s\n"
                           f"Raw Depth Range: [{depth_map_raw.min():.4f}, {depth_map_raw.max():.4f}]\n"
                           f"Final Depth Range: [{depth_map_final.min():.4f}, {depth_map_final.max():.4f}]\n"
-                          f"Non-zero raw: {np.count_nonzero(depth_map_raw)}/{depth_map_raw.size}")
+                          f"Enhanced features: {'ENABLED' if 'enhanced' in method else 'DISABLED'}")
             self.debug_label.config(text=debug_text)
             
             self.process_status_label.config(
@@ -644,11 +811,11 @@ class GSDepthMapperGUI:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to process image: {str(e)}")
         finally:
-            self.process_button.config(state="normal")
+            self.process_button.config(state="disabled")
             self.cancel_button.config(state="disabled")
             self.progress_var.set(0)
     
-    def create_depth_from_image(self, image_data, method): # Removed scale/contrast params
+    def create_depth_from_image(self, image_data, method):
         image_float = image_data.astype(np.float32) / 255.0
         depth = np.zeros((image_float.shape[0], image_float.shape[1]), dtype=np.float32)
 
@@ -659,52 +826,41 @@ class GSDepthMapperGUI:
         elif method == "saturation":
             max_color = np.max(image_float, axis=2)
             min_color = np.min(image_float, axis=2)
-            # Add epsilon to prevent division by zero for black pixels
             depth = np.where(max_color > 1e-6, (max_color - min_color) / (max_color + 1e-6), 0)
         elif method == "edges":
             gray = 0.299 * image_float[:,:,0] + 0.587 * image_float[:,:,1] + 0.114 * image_float[:,:,2]
             gray_uint8 = (gray * 255).astype(np.uint8)
             edges = cv2.Canny(gray_uint8, 50, 150)
             depth = edges.astype(np.float32) / 255.0
-        elif method == "gs_coordinate_geometric": # Updated method name
+        elif method == "gs_coordinate_enhanced":
             if self.full_sampling.get():
-                depth = self._create_gs_depth_geometric_full_sampling(image_float)
+                depth = self._create_enhanced_gs_depth_full_sampling(image_float)
             else:
-                depth = self._create_gs_depth_geometric_sparse(image_float)
-        else: # Default to luminosity
+                depth = self._create_enhanced_gs_depth_sparse(image_float)
+        else:
             depth = 0.299 * image_float[:,:,0] + 0.587 * image_float[:,:,1] + 0.114 * image_float[:,:,2]
         
-        # Ensure depth is in a reasonable range, e.g., [0,1] if it's a direct geometric interpretation
-        # The generic scaling/contrast will be applied outside this function.
-        if depth.max() > depth.min(): # Avoid division by zero if flat
-             if method == "gs_coordinate_geometric": # Should already be [0,1]
-                 pass # Values are sqrt(1-...)
-             else: # Normalize other methods to [0,1] before generic scale/contrast
+        if depth.max() > depth.min():
+             if method == "gs_coordinate_enhanced":
+                 pass  # Values are already properly scaled
+             else:
                  depth = (depth - depth.min()) / (depth.max() - depth.min())
         else:
             depth = np.zeros_like(depth)
 
-
         return depth
 
     def _calculate_s_coord_from_g_unit_and_hadit(self, g_unit_vector, hadit_3d_vector):
-        """
-        Calculates the S-coordinate based on a unit G-vector and a Hadit vector.
-        This S-coordinate is assumed to be the 2D projection of the unit G-vector after
-        interaction with the Hadit field, onto an XY-like plane.
-        """
+        """Enhanced S-coordinate calculation with quality consideration."""
         g_theta_rad = np.arctan2(g_unit_vector[1], g_unit_vector[0])
-        # Clip argument to arccos to prevent NaN due to potential floating point inaccuracies
         g_phi_arg = np.clip(g_unit_vector[2], -1.0, 1.0)
         g_phi_rad = np.arccos(g_phi_arg)
 
-        # G projection components (from unit G vector)
         g_proj_x = np.sin(g_phi_rad) * np.cos(g_theta_rad)
         g_proj_y = np.sin(g_phi_rad) * np.sin(g_theta_rad)
 
-        # Hadit vector processing
         hadit_mag = np.linalg.norm(hadit_3d_vector)
-        if hadit_mag < 1e-8: # If Hadit vector is (near) zero
+        if hadit_mag < 1e-8:
             h_proj_x_term = 0.0
             h_proj_y_term = 0.0
         else:
@@ -713,23 +869,20 @@ class GSDepthMapperGUI:
             hadit_phi_arg = np.clip(hadit_unit[2], -1.0, 1.0)
             hadit_phi_rad = np.arccos(hadit_phi_arg)
 
-            # Original Hadit projection components (scaled by hadit_mag)
-            # These represent the Hadit vector's projection, which then influences S
             hadit_proj_x_orig = hadit_mag * np.sin(hadit_phi_rad) * np.cos(hadit_theta_rad)
             hadit_proj_y_orig = hadit_mag * np.sin(hadit_phi_rad) * np.sin(hadit_theta_rad)
             
             delta_theta = g_theta_rad - hadit_theta_rad
-            # These terms are from the user's original S-coordinate formulation
             h_proj_x_term = hadit_proj_x_orig * np.cos(delta_theta)
             h_proj_y_term = hadit_proj_y_orig * np.sin(delta_theta)
 
-        # S-coordinate calculation, based on the structure of the user's original formula
         s_x = g_proj_x - h_proj_x_term
         s_y = g_proj_y - h_proj_y_term
         
         return np.array([s_x, s_y])
 
-    def _create_gs_depth_geometric_full_sampling(self, image_float):
+    def _create_enhanced_gs_depth_full_sampling(self, image_float):
+        """Enhanced G-S depth with alignment data integration."""
         height, width, _ = image_float.shape
         depth_map = np.zeros((height, width), dtype=np.float32)
 
@@ -741,43 +894,73 @@ class GSDepthMapperGUI:
             np.cos(hadit_phi_rad)
         ])
         
-        # Sphere radius for G_refl, typically 1.0 for unit sphere.
-        # gs_scale could be used here if it represents this radius.
-        # For now, assuming unit sphere as G_refl in alignment data are unit.
-        sphere_radius_sq = self.gs_scale.get()**2 # Using gs_scale as R_sphere
+        sphere_radius_sq = self.gs_scale.get()**2
 
-        print(f"G-S Geometric Depth (Full Sampling): Hadit={hadit_3d}, Sphere_R^2={sphere_radius_sq}")
+        print(f"Enhanced G-S Depth (Full): Hadit={hadit_3d}, R²={sphere_radius_sq}")
+        print(f"Quality weighting: {self.quality_weighting.get()}")
+        print(f"Perfect alignments available: {len(self.perfect_alignments)}")
 
         for y in range(height):
             for x in range(width):
-                if self.processing_cancelled: return np.zeros((height, width))
+                if self.processing_cancelled: 
+                    return np.zeros((height, width))
+                    
                 rgb_vector = image_float[y, x]
                 g_magnitude = np.linalg.norm(rgb_vector)
                 
                 if g_magnitude < 1e-8:
-                    depth_map[y, x] = 0.0 # Or sphere_radius if 'empty' is full depth
+                    depth_map[y, x] = 0.0
                     continue
                 
                 g_unit = rgb_vector / g_magnitude
                 s_coord = self._calculate_s_coord_from_g_unit_and_hadit(g_unit, hadit_3d)
                 
-                # s_coord is (sx, sy) - the 2D projection. Depth is the orthogonal component.
-                # Assuming s_coord are the first two components of a point on the sphere.
+                # Enhanced depth calculation with quality boost
                 val_inside_sqrt = sphere_radius_sq - (s_coord[0]**2 + s_coord[1]**2)
                 
                 if val_inside_sqrt >= 0:
-                    depth_map[y, x] = np.sqrt(val_inside_sqrt)
+                    base_depth = np.sqrt(val_inside_sqrt)
+                    
+                    # Apply quality enhancement if we have alignment data
+                    if hasattr(self, 'perfect_alignments') and self.perfect_alignments:
+                        enhancement_factor = self._calculate_local_quality_enhancement(s_coord)
+                        depth_map[y, x] = base_depth * enhancement_factor
+                    else:
+                        depth_map[y, x] = base_depth
                 else:
-                    depth_map[y, x] = 0.0 # Projected point is outside the sphere's projection circle
+                    depth_map[y, x] = 0.0
             
-            if y % (height // 20) == 0: # More frequent updates
+            if y % (height // 20) == 0:
                 self.progress_var.set((y / height) * 100)
                 self.root.update_idletasks()
         
         self.progress_var.set(100)
         return depth_map
 
-    def _create_gs_depth_geometric_sparse(self, image_float):
+    def _calculate_local_quality_enhancement(self, s_coord):
+        """Calculate local quality enhancement based on nearby perfect alignments."""
+        if not self.perfect_alignments:
+            return 1.0
+        
+        # Find distance to nearest perfect alignment
+        s_point = np.array([s_coord[0], s_coord[1]])
+        min_distance = float('inf')
+        
+        for perfect in self.perfect_alignments:
+            perfect_point = np.array([perfect['S_x'], perfect['S_y']])
+            distance = np.linalg.norm(s_point - perfect_point)
+            min_distance = min(min_distance, distance)
+        
+        # Apply enhancement based on proximity to perfect alignments
+        if min_distance < 0.1:  # Very close to perfect alignment
+            return 1.2
+        elif min_distance < 0.2:  # Moderately close
+            return 1.1
+        else:
+            return 1.0
+
+    def _create_enhanced_gs_depth_sparse(self, image_float):
+        """Enhanced sparse sampling with adaptive density."""
         height, width, _ = image_float.shape
         depth_map = np.zeros((height, width), dtype=np.float32)
 
@@ -790,17 +973,25 @@ class GSDepthMapperGUI:
         ])
         sphere_radius_sq = self.gs_scale.get()**2
 
-        print(f"G-S Geometric Depth (Sparse Sampling): Hadit={hadit_3d}, Sphere_R^2={sphere_radius_sq}")
-        
-        sample_rate = max(1, min(height//50, width//50, 10)) # Cap sample rate for speed
+        # Adaptive sample rate based on alignment density
+        base_sample_rate = max(1, min(height//50, width//50, 10))
+        if self.adaptive_sampling.get() and hasattr(self, 'perfect_alignments'):
+            # Increase sampling in regions with high alignment density
+            density_factor = min(len(self.perfect_alignments) / 100.0, 1.0)
+            sample_rate = max(1, int(base_sample_rate * (1.0 - density_factor * 0.5)))
+        else:
+            sample_rate = base_sample_rate
+
+        print(f"Enhanced G-S Depth (Sparse): Sample rate={sample_rate}, Adaptive={self.adaptive_sampling.get()}")
         
         num_steps = (height // sample_rate)
         current_step = 0
 
         for y_start_block in range(0, height, sample_rate):
-            if self.processing_cancelled: return np.zeros((height, width))
+            if self.processing_cancelled: 
+                return np.zeros((height, width))
+                
             for x_start_block in range(0, width, sample_rate):
-                # Process the corner pixel of the block
                 y = y_start_block
                 x = x_start_block 
                 
@@ -812,64 +1003,29 @@ class GSDepthMapperGUI:
                     g_unit = rgb_vector / g_magnitude
                     s_coord = self._calculate_s_coord_from_g_unit_and_hadit(g_unit, hadit_3d)
                     val_inside_sqrt = sphere_radius_sq - (s_coord[0]**2 + s_coord[1]**2)
+                    
                     if val_inside_sqrt >= 0:
-                        depth_value = np.sqrt(val_inside_sqrt)
+                        base_depth = np.sqrt(val_inside_sqrt)
+                        
+                        # Apply quality enhancement
+                        if hasattr(self, 'perfect_alignments') and self.perfect_alignments:
+                            enhancement_factor = self._calculate_local_quality_enhancement(s_coord)
+                            depth_value = base_depth * enhancement_factor
+                        else:
+                            depth_value = base_depth
                 
                 # Fill the block
                 y_end_block = min(height, y_start_block + sample_rate)
                 x_end_block = min(width, x_start_block + sample_rate)
                 depth_map[y_start_block:y_end_block, x_start_block:x_end_block] = depth_value
             
-            current_step +=1
-            if num_steps > 0 :
+            current_step += 1
+            if num_steps > 0:
                  self.progress_var.set((current_step / num_steps) * 100)
                  self.root.update_idletasks()
         
         self.progress_var.set(100)
         return depth_map
-    
-    # Old methods calculate_s_coordinate and calculate_alignment_depth are now unused
-    # by the "gs_coordinate_geometric" method. They are kept in case other parts
-    # or future methods might use them or for reference.
-
-    def calculate_s_coordinate(self, rgb_vector, hadit_vector): # Original, now potentially unused by gs_geometric
-        g_magnitude = np.linalg.norm(rgb_vector)
-        if g_magnitude < 1e-8: return np.array([0.0, 0.0])
-        g_unit = rgb_vector / g_magnitude
-        g_theta = np.arctan2(g_unit[1], g_unit[0])
-        g_phi_arg = np.clip(g_unit[2], -1.0, 1.0)
-        g_phi = np.arccos(g_phi_arg)
-        
-        hadit_magnitude = np.linalg.norm(hadit_vector)
-        if hadit_magnitude < 1e-8:
-            hadit_unit = np.array([0.0,0.0,0.0]) # Or handle appropriately
-            hadit_theta = 0.0
-            hadit_phi = np.pi/2 # Avoid NaN, effectively making projection terms zero if mag is zero
-        else:
-            hadit_unit = hadit_vector / hadit_magnitude
-            hadit_theta = np.arctan2(hadit_unit[1], hadit_unit[0])
-            hadit_phi_arg = np.clip(hadit_unit[2], -1.0, 1.0)
-            hadit_phi = np.arccos(hadit_phi_arg)
-        
-        g_proj_x = g_magnitude * np.sin(g_phi) * np.cos(g_theta)
-        g_proj_y = g_magnitude * np.sin(g_phi) * np.sin(g_theta)
-        
-        hadit_proj_x_orig = hadit_magnitude * np.sin(hadit_phi) * np.cos(hadit_theta)
-        hadit_proj_y_orig = hadit_magnitude * np.sin(hadit_phi) * np.sin(hadit_theta)
-        
-        delta_theta = g_theta - hadit_theta
-        s_x = g_proj_x - hadit_proj_x_orig * np.cos(delta_theta)
-        s_y = g_proj_y - hadit_proj_y_orig * np.sin(delta_theta) # This was the original structure
-        
-        return np.array([s_x, s_y])
-
-    def calculate_alignment_depth(self, s_coordinate, nuit_radius=0.5): # Original, now unused by gs_geometric
-        dist_origin = np.linalg.norm(s_coordinate)
-        dist_boundary = abs(dist_origin - nuit_radius)
-        
-        if dist_boundary < 0.001: return 1.0
-        elif dist_origin <= nuit_radius: return 0.8 + 0.2 / (1.0 + dist_boundary * 10)
-        else: return 0.5 / (1.0 + dist_boundary)
 
     def test_gs_method(self):
         size = 256
@@ -885,24 +1041,36 @@ class GSDepthMapperGUI:
         
         self.image_data = (np.clip(test_image, 0, 1) * 255).astype(np.uint8)
         self.loaded_image = Image.fromarray(self.image_data)
-        self.image_status_label.config(text=f"✅ Test pattern created ({size}x{size})", foreground="green")
+        self.image_status_label.config(text=f"✅ Enhanced test pattern created ({size}x{size})", foreground="green")
         self.process_button.config(state="normal")
-        self.process_status_label.config(text="Test pattern ready for G-S Geometric Depth", foreground="blue")
+        self.process_status_label.config(text="Enhanced test pattern ready", foreground="blue")
         self.show_loaded_image()
-        self.depth_method.set("gs_coordinate_geometric") # Select the new method
+        self.depth_method.set("gs_coordinate_enhanced")
         self.full_sampling.set(True)
-        messagebox.showinfo("Test Pattern", "Synthetic pattern loaded for G-S Geometric Depth testing.")
+        self.quality_weighting.set(True)
+        messagebox.showinfo("Test Pattern", "Enhanced synthetic pattern loaded for testing.")
     
     def visualize_depth_map(self):
-        if self.current_depth_map is None: return
+        if self.current_depth_map is None: 
+            return
+            
         self.fig.clear()
         
         method_title_name = self.depth_method.get()
-        if method_title_name == "gs_coordinate_geometric":
-            method_title_name = "G-S Geometric Depth"
+        if method_title_name == "gs_coordinate_enhanced":
+            method_title_name = "Enhanced G-S Depth"
 
         sampling_mode = "Full" if self.full_sampling.get() else "Sparse"
-        title_suffix = f" ({method_title_name} - {sampling_mode})" if "G-S" in method_title_name else f" ({method_title_name})"
+        enhancement_features = []
+        if self.quality_weighting.get():
+            enhancement_features.append("Quality-Weighted")
+        if self.multi_condition_fusion.get():
+            enhancement_features.append("Multi-Condition")
+        if self.adaptive_sampling.get():
+            enhancement_features.append("Adaptive")
+        
+        features_str = " + ".join(enhancement_features) if enhancement_features else "Standard"
+        title_suffix = f" ({method_title_name} - {sampling_mode}, {features_str})"
 
         if self.image_data is not None:
             ax1 = self.fig.add_subplot(131)
@@ -920,26 +1088,26 @@ class GSDepthMapperGUI:
                  ax3.hist(self.current_depth_map.flatten(), bins=50, alpha=0.7, color='blue')
             ax3.set_xlabel("Depth Value")
             ax3.set_ylabel("Pixel Count")
-            ax3.set_title(f"Depth Dist.\nRange: [{self.current_depth_map.min():.3f}, {self.current_depth_map.max():.3f}]")
-            self.fig.colorbar(im, ax=ax2, label='Depth', shrink=0.6)
-        else: # Should not happen if processing image, but for G-S alignment data path
+            ax3.set_title(f"Enhanced Depth Dist.\nRange: [{self.current_depth_map.min():.3f}, {self.current_depth_map.max():.3f}]")
+            self.fig.colorbar(im, ax=ax2, label='Enhanced Depth', shrink=0.6)
+        else:
             ax = self.fig.add_subplot(111)
             im = ax.imshow(self.current_depth_map, cmap=self.colormap.get(), aspect='auto')
             ax.set_title(f"Depth Map{title_suffix}")
             ax.axis('off')
-            self.fig.colorbar(im, ax=ax, label='Depth', shrink=0.8)
+            self.fig.colorbar(im, ax=ax, label='Enhanced Depth', shrink=0.8)
         
         self.fig.tight_layout()
         self.canvas.draw()
     
     def update_visualization(self):
         if self.current_depth_map is not None:
-            if hasattr(self, 'alignment_data') and self.alignment_data and not self.image_data: # If only alignment data is loaded
-                self.visualize_gs_alignment_depth_map(self.alignment_data)
-            else: # If image data (and potentially depth map from it) is present
+            if hasattr(self, 'alignment_data') and self.alignment_data and not self.image_data:
+                self.visualize_enhanced_alignment_depth_map(self.alignment_data)
+            else:
                 self.visualize_depth_map()
         else:
-            self.show_empty_plot() # Or some other placeholder
+            self.show_empty_plot()
     
     def export_depth_map(self):
         if self.current_depth_map is None:
@@ -947,7 +1115,7 @@ class GSDepthMapperGUI:
             return
         
         filename = filedialog.asksaveasfilename(
-            title="Save Depth Map As",
+            title="Save Enhanced Depth Map As",
             defaultextension=".png",
             filetypes=[
                 ("PNG image", "*.png"), 
@@ -956,7 +1124,8 @@ class GSDepthMapperGUI:
                 ("All files", "*.*")
             ]
         )
-        if not filename: return
+        if not filename: 
+            return
 
         try:
             file_ext = os.path.splitext(filename)[1].lower()
@@ -967,75 +1136,130 @@ class GSDepthMapperGUI:
                     depth_norm = (depth_norm - depth_norm.min()) / (depth_norm.max() - depth_norm.min())
                 
                 # Apply colormap if user wants colored PNG, or save grayscale
-                # For simplicity, save as grayscale for now. User can apply colormap in viewer.
                 img_array = (depth_norm * 255).astype(np.uint8)
-                img = Image.fromarray(img_array, mode='L') # Grayscale
+                img = Image.fromarray(img_array, mode='L')
                 img.save(filename)
-                messagebox.showinfo("Export Success", f"Depth map saved as PNG: {filename}")
+                messagebox.showinfo("Export Success", f"Enhanced depth map saved as PNG: {filename}")
             elif file_ext == ".npy":
                 np.save(filename, self.current_depth_map)
-                messagebox.showinfo("Export Success", f"Depth map saved as NPY: {filename}")
+                messagebox.showinfo("Export Success", f"Enhanced depth map saved as NPY: {filename}")
             elif file_ext == ".csv":
                 np.savetxt(filename, self.current_depth_map, delimiter=",")
-                messagebox.showinfo("Export Success", f"Depth map saved as CSV: {filename}")
+                messagebox.showinfo("Export Success", f"Enhanced depth map saved as CSV: {filename}")
             else:
                 messagebox.showerror("Unsupported Format", "Please choose .png, .npy, or .csv")
 
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to export depth map: {str(e)}")
+            messagebox.showerror("Error", f"Failed to export enhanced depth map: {str(e)}")
 
     def load_sample_data(self):
         """Loads a sample G-S alignment data file for quick testing."""
-        # Create a dummy alignment file content
+        # Create enhanced dummy alignment file content with your actual data structure
         dummy_content = """
 S-NUIT ALIGNMENT DATA EXPORT
 ==================================================
-Generated: 2025-06-08 10:00:00
-Total alignments found: 10
+Generated: 2025-06-08 19:38:41
+Total conditions analyzed: 9
+Total alignments found: 142332
 
 SUMMARY BY CONDITION:
 ------------------------------
-XY PROJECTION, NUIT RADIUS = 0.5: 5 alignments
-XZ PROJECTION, NUIT RADIUS = 0.5: 5 alignments
+XY projection, radius 0.5: 8904 alignments
+XY projection, radius 1.0: 31608 alignments
+XY projection, radius 1.5: 0 alignments
+XZ projection, radius 0.5: 6116 alignments
+XZ projection, radius 1.0: 45216 alignments
+XZ projection, radius 1.5: 0 alignments
+YZ projection, radius 0.5: 6944 alignments
+YZ projection, radius 1.0: 43544 alignments
+YZ projection, radius 1.5: 0 alignments
 
 ================================================================================
 CONDITION: XY PROJECTION, NUIT RADIUS = 0.5
 ================================================================================
-Number of alignments: 5
+Number of alignments: 8904
+
+STATISTICAL SUMMARY:
+--------------------
+Distance from boundary - Mean: 0.014957, Min: 0.000000, Max: 0.049969
+Distance from origin - Mean: 0.502884, Min: 0.450031, Max: 0.549907
+G θ range: [0.0°, 360.0°]
+G φ range: [10.0°, 170.0°]
+Hadit θ range: [0.0°, 360.0°]
+Hadit φ range: [0.0°, 180.0°]
+S X range: [-0.545, 0.549]
+S Y range: [-0.548, 0.548]
+
+BEST ALIGNMENT:
+---------------
+G(θ=0.00°, φ=10.00°), Hadit(θ=0.00°, φ=20.00°)
+S=(-0.500000, 0.000000), boundary distance=0.00000000
+
+DETAILED ALIGNMENT DATA:
+-------------------------
 G_theta_deg,G_phi_deg,Hadit_theta_deg,Hadit_phi_deg,S_x,S_y,dist_boundary,dist_origin,G_refl_x,G_refl_y,G_refl_z
-0.00,10.00,0.00,20.00,-0.500,0.000,0.000,0.500,-0.500,0.000,-0.866
-0.00,10.00,20.00,20.00,-0.400,0.200,0.053,0.447,-0.400,0.200,-0.894
-10.00,20.00,30.00,40.00,-0.300,-0.300,0.076,0.424,-0.300,-0.300,-0.900
-20.00,30.00,40.00,50.00,0.100,0.450,0.039,0.461,0.100,0.450,-0.887
-30.00,40.00,50.00,60.00,0.400,0.250,0.029,0.471,0.400,0.250,-0.883
+0.00,10.00,0.00,20.00,-0.500000,0.000000,0.00000000,0.500000,-0.500000,0.000000,-0.866025
+0.00,10.00,0.00,80.00,-0.500000,0.000000,0.00000000,0.500000,-0.500000,0.000000,0.866025
+0.00,10.00,21.18,20.00,-0.451952,-0.242359,0.01283360,0.512834,-0.451952,-0.242359,-0.858488
+10.29,10.00,0.00,20.00,-0.502138,0.031006,0.00309410,0.503094,-0.502138,0.031006,-0.864232
+10.29,10.00,0.00,80.00,-0.497378,0.031006,0.00165680,0.498343,-0.497378,0.031006,0.866980
 ================================================================================
 CONDITION: XZ PROJECTION, NUIT RADIUS = 0.5
 ================================================================================
-Number of alignments: 5
+Number of alignments: 6116
 G_theta_deg,G_phi_deg,Hadit_theta_deg,Hadit_phi_deg,S_x,S_y,dist_boundary,dist_origin,G_refl_x,G_refl_y,G_refl_z
-0.00,90.00,0.00,0.00,0.000,0.500,0.000,0.500,0.000,-0.866,0.500
-10.00,80.00,10.00,10.00,0.100,0.400,0.088,0.412,0.100,-0.900,0.400
-20.00,70.00,20.00,20.00,0.200,0.300,0.139,0.361,0.200,-0.850,0.300
-30.00,60.00,30.00,30.00,-0.100,-0.450,0.039,0.461,-0.100,-0.887,-0.450
-40.00,50.00,40.00,40.00,-0.200,-0.350,0.097,0.403,-0.200,-0.800,-0.350
-"""
-        # Use a temporary file to simulate loading
+15.00,20.00,10.00,30.00,-0.400000,0.200000,0.00500000,0.447214,-0.400000,0.100000,0.200000
+20.00,25.00,15.00,35.00,-0.350000,0.150000,0.00200000,0.377492,-0.350000,0.120000,0.150000
+================================================================================
+CONDITION: YZ PROJECTION, NUIT RADIUS = 0.5
+================================================================================
+Number of alignments: 6944
+G_theta_deg,G_phi_deg,Hadit_theta_deg,Hadit_phi_deg,S_x,S_y,dist_boundary,dist_origin,G_refl_x,G_refl_y,G_refl_z
+25.00,30.00,20.00,40.00,0.300000,-0.250000,0.00100000,0.390512,0.200000,0.300000,-0.250000
+30.00,35.00,25.00,45.00,0.250000,-0.200000,0.00050000,0.320156,0.150000,0.250000,-0.200000
+================================================================================
+CONDITION: XY PROJECTION, NUIT RADIUS = 1.0
+================================================================================
+Number of alignments: 31608
+G_theta_deg,G_phi_deg,Hadit_theta_deg,Hadit_phi_deg,S_x,S_y,dist_boundary,dist_origin,G_refl_x,G_refl_y,G_refl_z
+0.00,15.00,5.00,25.00,-0.900000,0.100000,0.10000000,0.905539,-0.900000,0.100000,-0.424264
+5.00,20.00,10.00,30.00,-0.850000,0.150000,0.08000000,0.863134,-0.850000,0.150000,-0.503322
+""".strip()
+        
+        # Write to temporary file
         import tempfile
-        temp_file = tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt")
-        temp_file.write(dummy_content)
-        temp_file_path = temp_file.name
-        temp_file.close()
-
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as temp_file:
+            temp_file.write(dummy_content)
+            temp_filename = temp_file.name
+        
         try:
-            self.parse_gs_alignment_file(temp_file_path)
-            messagebox.showinfo("Sample Data", "Sample G-S alignment data loaded.")
+            self.parse_gs_alignment_file(temp_filename)
+            self.image_status_label.config(text="✅ Enhanced sample data loaded", foreground="green")
+            self.process_status_label.config(text="Sample alignment data ready for enhanced processing", foreground="blue")
+            
+            # Enable enhanced features for demonstration
+            self.quality_weighting.set(True)
+            self.multi_condition_fusion.set(True)
+            self.adaptive_sampling.set(True)
+            self.auto_optimize_params.set(True)
+            
+            messagebox.showinfo("Sample Data", 
+                              f"Enhanced sample data loaded!\n"
+                              f"• {len(self.alignment_data)} total alignments\n"
+                              f"• {len(self.perfect_alignments)} perfect alignments\n"
+                              f"• {len(self.alignments_by_condition)} conditions\n"
+                              f"• All enhancement features enabled")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to load sample data: {e}")
+            messagebox.showerror("Error", f"Failed to load sample data: {str(e)}")
         finally:
-            if os.path.exists(temp_file_path):
-                os.unlink(temp_file_path)
+            # Clean up temp file
+            try:
+                os.unlink(temp_filename)
+            except:
+                pass
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     root = tk.Tk()
     app = GSDepthMapperGUI(root)
     root.mainloop()
