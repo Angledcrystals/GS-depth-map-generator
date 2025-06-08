@@ -1,0 +1,645 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+import cv2
+import os
+from PIL import Image, ImageTk
+
+class GSDepthMapperGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("G-S Alignment Depth Mapper - Fixed v2")
+        self.root.geometry("1400x900")
+        
+        # Data storage
+        self.alignment_data = []
+        self.perfect_alignments = []
+        self.current_depth_map = None
+        self.current_coords = None
+        self.loaded_image = None
+        self.image_data = None
+        
+        # Default parameters
+        self.resolution = tk.IntVar(value=256)
+        self.colormap = tk.StringVar(value="viridis")
+        self.nuit_radius = tk.DoubleVar(value=0.5)
+        
+        # Image processing parameters
+        self.hadit_theta = tk.DoubleVar(value=45.0)  # Better default
+        self.hadit_phi = tk.DoubleVar(value=60.0)    # Better default
+        self.depth_method = tk.StringVar(value="luminosity")
+        self.depth_scale = tk.DoubleVar(value=1.0)
+        self.depth_contrast = tk.DoubleVar(value=1.0)
+        self.gs_scale = tk.DoubleVar(value=1.0)      # New parameter for G-S scaling
+        
+        self.setup_gui()
+        
+    def setup_gui(self):
+        """Setup the main GUI layout."""
+        # Create main frames
+        control_frame = ttk.Frame(self.root)
+        control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
+        
+        viz_frame = ttk.Frame(self.root)
+        viz_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        self.setup_control_panel(control_frame)
+        self.setup_visualization_panel(viz_frame)
+        
+    def setup_control_panel(self, parent):
+        """Setup the control panel."""
+        # Title
+        title_label = ttk.Label(parent, text="G-S Depth Mapper", font=("Arial", 16, "bold"))
+        title_label.pack(pady=(0, 20))
+        
+        # Step 1: Image Loading
+        image_frame = ttk.LabelFrame(parent, text="Step 1: Load Image", padding=10)
+        image_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Button(image_frame, text="📁 Load Image File", 
+                  command=self.load_image, width=25).pack(fill=tk.X, pady=2)
+        
+        self.image_status_label = ttk.Label(image_frame, text="No image loaded", foreground="red")
+        self.image_status_label.pack(pady=5)
+        
+        # Step 2: Processing Parameters
+        params_frame = ttk.LabelFrame(parent, text="Step 2: Processing Parameters", padding=10)
+        params_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        # Depth method
+        ttk.Label(params_frame, text="Depth Method:").pack(anchor=tk.W)
+        methods = [
+            ("Luminosity (Brightness)", "luminosity"),
+            ("RGB Magnitude", "rgb_magnitude"),
+            ("Saturation", "saturation"),
+            ("G-S Coordinate (Fixed)", "gs_coordinate"),
+            ("Edge Detection", "edges")
+        ]
+        
+        for text, value in methods:
+            ttk.Radiobutton(params_frame, text=text, variable=self.depth_method, 
+                           value=value).pack(anchor=tk.W)
+        
+        # Depth scale
+        ttk.Label(params_frame, text="Depth Scale:").pack(anchor=tk.W, pady=(10, 0))
+        scale_frame = ttk.Frame(params_frame)
+        scale_frame.pack(fill=tk.X, pady=2)
+        ttk.Scale(scale_frame, from_=0.1, to=5.0, variable=self.depth_scale, 
+                 orient=tk.HORIZONTAL).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(scale_frame, textvariable=self.depth_scale, width=8).pack(side=tk.RIGHT)
+        
+        # Depth contrast
+        ttk.Label(params_frame, text="Depth Contrast:").pack(anchor=tk.W, pady=(10, 0))
+        contrast_frame = ttk.Frame(params_frame)
+        contrast_frame.pack(fill=tk.X, pady=2)
+        ttk.Scale(contrast_frame, from_=0.1, to=3.0, variable=self.depth_contrast, 
+                 orient=tk.HORIZONTAL).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(contrast_frame, textvariable=self.depth_contrast, width=8).pack(side=tk.RIGHT)
+        
+        # G-S specific parameters
+        gs_frame = ttk.LabelFrame(params_frame, text="G-S Parameters (for G-S method)", padding=5)
+        gs_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        ttk.Label(gs_frame, text="Hadit θ (degrees):").pack(anchor=tk.W)
+        theta_frame = ttk.Frame(gs_frame)
+        theta_frame.pack(fill=tk.X)
+        ttk.Scale(theta_frame, from_=0, to=360, variable=self.hadit_theta, 
+                 orient=tk.HORIZONTAL).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(theta_frame, textvariable=self.hadit_theta, width=8).pack(side=tk.RIGHT)
+        
+        ttk.Label(gs_frame, text="Hadit φ (degrees):").pack(anchor=tk.W)
+        phi_frame = ttk.Frame(gs_frame)
+        phi_frame.pack(fill=tk.X)
+        ttk.Scale(phi_frame, from_=0, to=180, variable=self.hadit_phi, 
+                 orient=tk.HORIZONTAL).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(phi_frame, textvariable=self.hadit_phi, width=8).pack(side=tk.RIGHT)
+        
+        ttk.Label(gs_frame, text="G-S Scale Factor:").pack(anchor=tk.W)
+        gs_scale_frame = ttk.Frame(gs_frame)
+        gs_scale_frame.pack(fill=tk.X)
+        ttk.Scale(gs_scale_frame, from_=0.1, to=10.0, variable=self.gs_scale, 
+                 orient=tk.HORIZONTAL).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(gs_scale_frame, textvariable=self.gs_scale, width=8).pack(side=tk.RIGHT)
+        
+        # Step 3: Process Image
+        process_frame = ttk.LabelFrame(parent, text="Step 3: Process Image", padding=10)
+        process_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.process_button = ttk.Button(process_frame, text="🔄 Process Image to Depth Map", 
+                                        command=self.process_image_to_depth_map, 
+                                        width=25, state="disabled")
+        self.process_button.pack(fill=tk.X, pady=2)
+        
+        self.process_status_label = ttk.Label(process_frame, text="Load an image first", foreground="orange")
+        self.process_status_label.pack(pady=5)
+        
+        # Step 4: Visualization
+        viz_frame_control = ttk.LabelFrame(parent, text="Step 4: Visualization", padding=10)
+        viz_frame_control.pack(fill=tk.X, pady=(0, 10))
+        
+        # Resolution
+        ttk.Label(viz_frame_control, text="Resolution:").pack(anchor=tk.W)
+        resolution_frame = ttk.Frame(viz_frame_control)
+        resolution_frame.pack(fill=tk.X, pady=2)
+        ttk.Scale(resolution_frame, from_=64, to=1024, variable=self.resolution, 
+                 orient=tk.HORIZONTAL).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(resolution_frame, textvariable=self.resolution, width=5).pack(side=tk.RIGHT)
+        
+        # Colormap
+        ttk.Label(viz_frame_control, text="Colormap:").pack(anchor=tk.W, pady=(10, 0))
+        colormap_combo = ttk.Combobox(viz_frame_control, textvariable=self.colormap, 
+                                     values=["viridis", "plasma", "hot", "coolwarm", 
+                                            "jet", "terrain", "ocean", "rainbow", "gray"])
+        colormap_combo.pack(fill=tk.X, pady=2)
+        
+        # Update visualization button
+        self.update_viz_button = ttk.Button(viz_frame_control, text="🎨 Update Visualization", 
+                                           command=self.update_visualization, 
+                                           state="disabled")
+        self.update_viz_button.pack(fill=tk.X, pady=5)
+        
+        # Debug info
+        debug_frame = ttk.LabelFrame(viz_frame_control, text="Debug Info", padding=5)
+        debug_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        self.debug_label = ttk.Label(debug_frame, text="No processing done yet", font=("Courier", 8))
+        self.debug_label.pack(fill=tk.X)
+        
+        # Step 5: Export
+        export_frame = ttk.LabelFrame(parent, text="Step 5: Export", padding=10)
+        export_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.export_button = ttk.Button(export_frame, text="💾 Export Depth Map", 
+                                       command=self.export_depth_map, 
+                                       state="disabled")
+        self.export_button.pack(fill=tk.X, pady=2)
+        
+        # Quick actions
+        quick_frame = ttk.LabelFrame(parent, text="Quick Test", padding=10)
+        quick_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        ttk.Button(quick_frame, text="🧪 Load Sample Data", 
+                  command=self.load_sample_data).pack(fill=tk.X, pady=2)
+        
+        ttk.Button(quick_frame, text="🎯 Test G-S Method", 
+                  command=self.test_gs_method).pack(fill=tk.X, pady=2)
+        
+    def setup_visualization_panel(self, parent):
+        """Setup the visualization panel."""
+        # Create matplotlib figure
+        self.fig = Figure(figsize=(12, 10), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.fig, parent)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        # Add toolbar
+        toolbar_frame = ttk.Frame(parent)
+        toolbar_frame.pack(fill=tk.X)
+        
+        from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+        toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        toolbar.update()
+        
+        # Initial empty plot
+        self.show_empty_plot()
+    
+    def show_empty_plot(self):
+        """Show empty plot with instructions."""
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+        ax.text(0.5, 0.5, "Load an image to get started!\n\n1. Click 'Load Image File'\n2. Adjust parameters\n3. Click 'Process Image to Depth Map'", 
+                ha='center', va='center', fontsize=14, transform=ax.transAxes)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_title("G-S Depth Mapper - Ready")
+        self.canvas.draw()
+    
+    def load_image(self):
+        """Load an image file."""
+        filename = filedialog.askopenfilename(
+            title="Select Image File",
+            filetypes=[
+                ("Image files", "*.png *.jpg *.jpeg *.tiff *.tif *.bmp *.gif"),
+                ("PNG files", "*.png"),
+                ("JPEG files", "*.jpg *.jpeg"),
+                ("TIFF files", "*.tiff *.tif"),
+                ("All files", "*.*")
+            ]
+        )
+        
+        if filename:
+            try:
+                # Load image with PIL
+                pil_image = Image.open(filename)
+                
+                # Convert to RGB if necessary
+                if pil_image.mode != 'RGB':
+                    pil_image = pil_image.convert('RGB')
+                
+                # Store original image
+                self.loaded_image = pil_image
+                
+                # Convert to numpy array
+                self.image_data = np.array(pil_image)
+                
+                # Update status
+                self.image_status_label.config(
+                    text=f"✅ Loaded: {os.path.basename(filename)} ({self.image_data.shape[1]}x{self.image_data.shape[0]})",
+                    foreground="green"
+                )
+                
+                # Enable process button
+                self.process_button.config(state="normal")
+                self.process_status_label.config(text="Ready to process image", foreground="blue")
+                
+                # Show the loaded image
+                self.show_loaded_image()
+                
+                messagebox.showinfo("Success", f"Image loaded: {os.path.basename(filename)}")
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to load image: {str(e)}")
+    
+    def show_loaded_image(self):
+        """Show the loaded image."""
+        if self.image_data is not None:
+            self.fig.clear()
+            ax = self.fig.add_subplot(111)
+            ax.imshow(self.image_data)
+            ax.set_title(f"Loaded Image: {self.image_data.shape[1]}x{self.image_data.shape[0]} pixels")
+            ax.axis('off')
+            self.canvas.draw()
+    
+    def process_image_to_depth_map(self):
+        """Process the loaded image to create depth map."""
+        if self.image_data is None:
+            messagebox.showwarning("No Image", "Please load an image first")
+            return
+        
+        try:
+            # Get processing parameters
+            method = self.depth_method.get()
+            depth_scale = self.depth_scale.get()
+            depth_contrast = self.depth_contrast.get()
+            
+            # Process image
+            depth_map = self.create_depth_from_image(self.image_data, method, depth_scale, depth_contrast)
+            
+            # Store current depth map
+            self.current_depth_map = depth_map
+            height, width = depth_map.shape
+            x = np.linspace(0, width-1, width)
+            y = np.linspace(0, height-1, height)
+            self.current_coords = np.meshgrid(x, y)
+            
+            # Debug info
+            debug_text = f"Method: {method}\nDepth range: [{depth_map.min():.4f}, {depth_map.max():.4f}]\nNon-zero pixels: {np.count_nonzero(depth_map)}/{depth_map.size}"
+            self.debug_label.config(text=debug_text)
+            
+            # Update status
+            self.process_status_label.config(
+                text=f"✅ Processed using {method} method", 
+                foreground="green"
+            )
+            
+            # Enable visualization and export buttons
+            self.update_viz_button.config(state="normal")
+            self.export_button.config(state="normal")
+            
+            # Show the depth map
+            self.visualize_depth_map()
+            
+            messagebox.showinfo("Success", f"Image processed to depth map using {method} method")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to process image: {str(e)}")
+    
+    def create_depth_from_image(self, image_data, method, depth_scale, depth_contrast):
+        """Create depth map from image using specified method."""
+        # Convert to float
+        image_float = image_data.astype(np.float32) / 255.0
+        
+        if method == "luminosity":
+            # Standard luminosity formula
+            depth = 0.299 * image_float[:,:,0] + 0.587 * image_float[:,:,1] + 0.114 * image_float[:,:,2]
+        
+        elif method == "rgb_magnitude":
+            # RGB vector magnitude
+            depth = np.sqrt(image_float[:,:,0]**2 + image_float[:,:,1]**2 + image_float[:,:,2]**2) / np.sqrt(3)
+        
+        elif method == "saturation":
+            # Color saturation
+            max_color = np.max(image_float, axis=2)
+            min_color = np.min(image_float, axis=2)
+            depth = np.where(max_color > 0, (max_color - min_color) / max_color, 0)
+        
+        elif method == "edges":
+            # Edge detection depth
+            gray = 0.299 * image_float[:,:,0] + 0.587 * image_float[:,:,1] + 0.114 * image_float[:,:,2]
+            gray_uint8 = (gray * 255).astype(np.uint8)
+            edges = cv2.Canny(gray_uint8, 50, 150)
+            depth = edges.astype(np.float32) / 255.0
+        
+        elif method == "gs_coordinate":
+            # Fixed G-S coordinate method
+            depth = self.create_gs_depth_from_image_fixed(image_float)
+        
+        else:
+            # Default to luminosity
+            depth = 0.299 * image_float[:,:,0] + 0.587 * image_float[:,:,1] + 0.114 * image_float[:,:,2]
+        
+        # Apply scaling and contrast
+        depth = depth * depth_scale
+        depth = np.power(np.clip(depth, 0, 1), depth_contrast)
+        
+        return depth
+    
+    def create_gs_depth_from_image_fixed(self, image_float):
+        """Create depth using FIXED G-S alignment method."""
+        height, width, _ = image_float.shape
+        depth_map = np.zeros((height, width))
+        
+        # Get Hadit parameters
+        hadit_theta = np.radians(self.hadit_theta.get())
+        hadit_phi = np.radians(self.hadit_phi.get())
+        gs_scale = self.gs_scale.get()
+        
+        # Create Hadit vector
+        hadit_3d = np.array([
+            np.sin(hadit_phi) * np.cos(hadit_theta),
+            np.sin(hadit_phi) * np.sin(hadit_theta),
+            np.cos(hadit_phi)
+        ])
+        
+        print(f"Hadit vector: {hadit_3d}")  # Debug
+        
+        # Process in batches for efficiency
+        for y in range(0, height, max(1, height//50)):  # Sample every few pixels
+            for x in range(0, width, max(1, width//50)):
+                # Method 1: Direct RGB-based depth using your S-coordinate formula
+                r, g, b = image_float[y, x]
+                
+                # Treat RGB as a 3D vector (like G vector)
+                rgb_vector = np.array([r, g, b])
+                rgb_magnitude = np.linalg.norm(rgb_vector)
+                
+                if rgb_magnitude > 0:
+                    rgb_unit = rgb_vector / rgb_magnitude
+                    
+                    # Apply Householder reflection (your Hadit operation)
+                    hadit_unit = hadit_3d / np.linalg.norm(hadit_3d)
+                    dot_product = np.dot(hadit_unit, rgb_unit)
+                    reflected = rgb_unit - 2 * dot_product * hadit_unit
+                    
+                    # Use reflected vector magnitude as depth indicator
+                    depth_value = np.linalg.norm(reflected) * rgb_magnitude * gs_scale
+                    
+                    # Fill a small region around this pixel
+                    y_start = max(0, y)
+                    y_end = min(height, y + max(1, height//50))
+                    x_start = max(0, x)
+                    x_end = min(width, x + max(1, width//50))
+                    
+                    depth_map[y_start:y_end, x_start:x_end] = depth_value
+        
+        print(f"G-S depth range: [{depth_map.min():.6f}, {depth_map.max():.6f}]")  # Debug
+        
+        # If still empty, use alternative method
+        if depth_map.max() == 0:
+            print("G-S method produced zero depth, using alternative calculation...")
+            
+            # Alternative: Use position-based G-S calculation
+            for y in range(height):
+                for x in range(width):
+                    # Convert pixel position to normalized coordinates
+                    norm_x = (x / width) * 2 - 1  # [-1, 1]
+                    norm_y = (y / height) * 2 - 1  # [-1, 1]
+                    
+                    # Create position vector
+                    pos_vector = np.array([norm_x, norm_y, 0.5])  # Add Z component
+                    pos_magnitude = np.linalg.norm(pos_vector)
+                    
+                    if pos_magnitude > 0:
+                        pos_unit = pos_vector / pos_magnitude
+                        
+                        # Apply Hadit reflection
+                        hadit_unit = hadit_3d / np.linalg.norm(hadit_3d)
+                        dot_product = np.dot(hadit_unit, pos_unit)
+                        reflected = pos_unit - 2 * dot_product * hadit_unit
+                        
+                        # Modulate by image content
+                        r, g, b = image_float[y, x]
+                        luminosity = 0.299 * r + 0.587 * g + 0.114 * b
+                        
+                        # Calculate final depth
+                        depth_value = np.linalg.norm(reflected) * luminosity * gs_scale
+                        depth_map[y, x] = depth_value
+        
+        # Normalize depth map
+        if depth_map.max() > 0:
+            depth_map = depth_map / depth_map.max()
+        
+        return depth_map
+    
+    def test_gs_method(self):
+        """Test G-S method with a synthetic pattern."""
+        # Create a test pattern
+        size = 256
+        test_image = np.zeros((size, size, 3), dtype=np.float32)
+        
+        # Create a gradient pattern
+        for y in range(size):
+            for x in range(size):
+                # Create radial gradient
+                center_x, center_y = size // 2, size // 2
+                distance = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+                normalized_distance = distance / (size // 2)
+                
+                # Color based on position
+                test_image[y, x, 0] = np.sin(x / size * np.pi) * 0.5 + 0.5  # Red
+                test_image[y, x, 1] = np.sin(y / size * np.pi) * 0.5 + 0.5  # Green
+                test_image[y, x, 2] = (1 - normalized_distance) if normalized_distance < 1 else 0  # Blue
+        
+        # Store test image
+        self.image_data = (test_image * 255).astype(np.uint8)
+        self.loaded_image = Image.fromarray(self.image_data)
+        
+        # Update status
+        self.image_status_label.config(
+            text=f"✅ Test pattern created ({size}x{size})",
+            foreground="green"
+        )
+        
+        # Enable process button
+        self.process_button.config(state="normal")
+        self.process_status_label.config(text="Test pattern ready for G-S processing", foreground="blue")
+        
+        # Show the test image
+        self.show_loaded_image()
+        
+        # Auto-select G-S method
+        self.depth_method.set("gs_coordinate")
+        
+        messagebox.showinfo("Test Pattern", "Created synthetic test pattern for G-S method testing")
+    
+    def visualize_depth_map(self):
+        """Visualize the current depth map."""
+        if self.current_depth_map is None:
+            return
+        
+        self.fig.clear()
+        
+        # Create subplots
+        if self.image_data is not None:
+            ax1 = self.fig.add_subplot(121)
+            ax2 = self.fig.add_subplot(122)
+            
+            # Show original image
+            ax1.imshow(self.image_data)
+            ax1.set_title("Original Image")
+            ax1.axis('off')
+        else:
+            ax2 = self.fig.add_subplot(111)
+        
+        # Show depth map
+        im = ax2.imshow(self.current_depth_map, cmap=self.colormap.get())
+        ax2.set_title(f"Depth Map ({self.depth_method.get()})\nRange: [{self.current_depth_map.min():.3f}, {self.current_depth_map.max():.3f}]")
+        ax2.axis('off')
+        
+        # Add colorbar
+        self.fig.colorbar(im, ax=ax2, label='Depth')
+        
+        self.fig.tight_layout()
+        self.canvas.draw()
+    
+    def update_visualization(self):
+        """Update the visualization with current parameters."""
+        if self.current_depth_map is not None:
+            self.visualize_depth_map()
+    
+    def export_depth_map(self):
+        """Export the current depth map."""
+        if self.current_depth_map is None:
+            messagebox.showwarning("No Depth Map", "Please process an image first")
+            return
+        
+        # Ask for output file
+        filename = filedialog.asksaveasfilename(
+            title="Save Depth Map",
+            defaultextension=".png",
+            filetypes=[
+                ("PNG files", "*.png"),
+                ("TIFF files", "*.tiff"),
+                ("NumPy files", "*.npy"),
+                ("All files", "*.*")
+            ]
+        )
+        
+        if filename:
+            try:
+                if filename.endswith('.npy'):
+                    # Save as numpy array
+                    np.save(filename, self.current_depth_map)
+                else:
+                    # Save as image
+                    if filename.endswith('.tiff'):
+                        # 16-bit TIFF
+                        depth_16bit = (self.current_depth_map * 65535).astype(np.uint16)
+                        cv2.imwrite(filename, depth_16bit)
+                    else:
+                        # 8-bit PNG
+                        depth_8bit = (self.current_depth_map * 255).astype(np.uint8)
+                        cv2.imwrite(filename, depth_8bit)
+                
+                messagebox.showinfo("Success", f"Depth map exported to {filename}")
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to export: {str(e)}")
+    
+    def load_sample_data(self):
+        """Load sample alignment data for testing without an image."""
+        # Generate sample data
+        np.random.seed(42)
+        resolution = self.resolution.get()
+        
+        # Create a synthetic depth map with interesting features
+        x = np.linspace(-2, 2, resolution)
+        y = np.linspace(-2, 2, resolution)
+        X, Y = np.meshgrid(x, y)
+        
+        # Create depth pattern based on your alignment structure
+        depth_map = np.zeros_like(X)
+        
+        # Add perfect alignment peaks at specific locations (your quantum levels)
+        peak_locations = [(-0.5, 0), (0.5, 0), (0, -0.5), (0, 0.5), (0, 0)]
+        
+        for px, py in peak_locations:
+            # Create Gaussian peaks
+            sigma = 0.3
+            peak = np.exp(-((X - px)**2 + (Y - py)**2) / (2 * sigma**2))
+            depth_map += peak
+        
+        # Add some noise and structure
+        depth_map += 0.1 * np.sin(2*np.pi*X) * np.cos(2*np.pi*Y)
+        
+        # Add circular Nuit boundary effect
+        nuit_radius = self.nuit_radius.get()
+        distance_from_origin = np.sqrt(X**2 + Y**2)
+        boundary_effect = np.exp(-((distance_from_origin - nuit_radius)**2) / (2 * 0.1**2))
+        depth_map += 0.5 * boundary_effect
+        
+        # Normalize
+        depth_map = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min())
+        
+        # Store the depth map
+        self.current_depth_map = depth_map
+        self.current_coords = (X, Y)
+        
+        # Enable buttons
+        self.update_viz_button.config(state="normal")
+        self.export_button.config(state="normal")
+        
+        # Update status
+        self.process_status_label.config(text="✅ Sample G-S alignment depth map created", foreground="green")
+        
+        # Debug info
+        debug_text = f"Sample Data\nDepth range: [{depth_map.min():.4f}, {depth_map.max():.4f}]\nPeaks: {len(peak_locations)}"
+        self.debug_label.config(text=debug_text)
+        
+        # Show the depth map
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+        im = ax.imshow(depth_map, cmap=self.colormap.get(), extent=[-2, 2, -2, 2])
+        ax.set_title("Sample G-S Alignment Depth Map\n(Perfect Alignment Peaks + Nuit Boundary)")
+        ax.set_xlabel("S_x")
+        ax.set_ylabel("S_y")
+        
+        # Mark perfect alignment locations
+        for px, py in peak_locations:
+            ax.plot(px, py, 'r*', markersize=10, label='Perfect Alignment' if px == peak_locations[0][0] else "")
+        
+        # Draw Nuit boundary
+        circle = plt.Circle((0, 0), nuit_radius, fill=False, color='red', linewidth=2, linestyle='--')
+        ax.add_patch(circle)
+        
+        ax.legend()
+        self.fig.colorbar(im, ax=ax, label='Depth')
+        self.canvas.draw()
+        
+        messagebox.showinfo("Sample Data", f"Generated G-S alignment depth map with {len(peak_locations)} perfect alignment peaks")
+
+def main():
+    """Main function to run the GUI application."""
+    root = tk.Tk()
+    app = GSDepthMapperGUI(root)
+    
+    # Add some styling
+    style = ttk.Style()
+    style.theme_use('clam')
+    
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
