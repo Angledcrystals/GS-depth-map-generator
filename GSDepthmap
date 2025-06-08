@@ -990,46 +990,86 @@ class GSDepthMapperGUI:
             else:
                 # Regular depth map visualization
                 self.visualize_depth_map()
-    
+
     def export_depth_map(self):
-        """Export the current depth map."""
+        """Export the current depth map as 16-bit TIFF with proper normalization."""
         if self.current_depth_map is None:
             messagebox.showwarning("No Depth Map", "Please process data first")
             return
-        
-        # Ask for output file
+
+        # Ask for output file - default to 16-bit TIFF
         filename = filedialog.asksaveasfilename(
-            title="Save Depth Map",
-            defaultextension=".png",
+            title="Save Depth Map as 16-bit TIFF",
+            defaultextension=".tiff",
             filetypes=[
-                ("PNG files", "*.png"),
                 ("TIFF files", "*.tiff"),
+                ("TIFF files", "*.tif"),
                 ("NumPy files", "*.npy"),
                 ("All files", "*.*")
             ]
         )
-        
+
         if filename:
             try:
-                if filename.endswith('.npy'):
-                    # Save as numpy array
-                    np.save(filename, self.current_depth_map)
-                else:
-                    # Save as image
-                    if filename.endswith('.tiff'):
-                        # 16-bit TIFF
-                        depth_16bit = (self.current_depth_map * 65535).astype(np.uint16)
-                        cv2.imwrite(filename, depth_16bit)
+                # ONLY FIX: Proper normalization for small depth values
+                depth_for_export = self.current_depth_map.copy()
+
+                # Clean any NaN/inf values
+                depth_for_export = np.nan_to_num(depth_for_export, nan=0.0, posinf=1.0, neginf=0.0)
+
+                # Find actual data range (excluding zeros)
+                non_zero_values = depth_for_export[depth_for_export > 1e-10]
+
+                if len(non_zero_values) > 0:
+                    actual_min = non_zero_values.min()
+                    actual_max = non_zero_values.max()
+
+                    print(f"Export info:")
+                    print(f"  Original range: [{actual_min:.6f}, {actual_max:.6f}]")
+                    print(f"  Non-zero pixels: {len(non_zero_values)}/{depth_for_export.size}")
+
+                    if actual_max > actual_min:
+                        # Normalize using ACTUAL data range (not 0-1)
+                        depth_for_export = np.where(
+                            depth_for_export > 1e-10,
+                            (depth_for_export - actual_min) / (actual_max - actual_min),
+                            0.0
+                        )
+                        print(f"  Normalized range: [{depth_for_export.min():.6f}, {depth_for_export.max():.6f}]")
                     else:
-                        # 8-bit PNG
-                        depth_8bit = (self.current_depth_map * 255).astype(np.uint8)
-                        cv2.imwrite(filename, depth_8bit)
-                
-                messagebox.showinfo("Success", f"Depth map exported to {filename}")
-                
+                        # All non-zero values are the same
+                        depth_for_export = np.where(depth_for_export > 1e-10, 0.5, 0.0)
+                        print(f"  Uniform value detected, set to 0.5")
+                else:
+                    print(f"  Warning: No non-zero values found in depth map")
+                    depth_for_export = np.zeros_like(depth_for_export)
+
+                # Export based on file extension
+                if filename.endswith('.npy'):
+                    # Save original values as NumPy array
+                    np.save(filename, self.current_depth_map)
+                    print(f"  Saved original values as NumPy array")
+                else:
+                    # Export as 16-bit TIFF (much better than 8-bit PNG)
+                    depth_16bit = (depth_for_export * 65535).astype(np.uint16)
+                    cv2.imwrite(filename, depth_16bit)
+                    print(f"  Exported as 16-bit TIFF: range {depth_16bit.min()}-{depth_16bit.max()}")
+
+                # Success message with statistics
+                stats_msg = f"✅ Depth map exported successfully!\n\n"
+                stats_msg += f"File: {os.path.basename(filename)}\n"
+                stats_msg += f"Format: {'NumPy Array' if filename.endswith('.npy') else '16-bit TIFF'}\n"
+                stats_msg += f"Original range: [{self.current_depth_map.min():.6f}, {self.current_depth_map.max():.6f}]\n"
+                stats_msg += f"Exported range: [{depth_for_export.min():.6f}, {depth_for_export.max():.6f}]\n"
+                stats_msg += f"Non-zero pixels: {np.count_nonzero(depth_for_export):,}/{depth_for_export.size:,}"
+
+                messagebox.showinfo("Export Success", stats_msg)
+
             except Exception as e:
-                messagebox.showerror("Error", f"Failed to export: {str(e)}")
-    
+                error_msg = f"❌ Export failed: {str(e)}"
+                print(error_msg)
+                messagebox.showerror("Export Error", error_msg)
+
     def load_sample_data(self):
         """Load sample alignment data for testing without an image."""
         # Generate sample data
